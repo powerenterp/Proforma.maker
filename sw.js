@@ -1,38 +1,51 @@
-// Proforma Invoices - service worker.
-// Keeps the app SHELL available (opens fast, installable, loads offline). It never stores your data:
-// only same-origin GET requests are handled, so the secure server calls are never cached.
-const CACHE = 'proforma-shell-v1';
-const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
-               'icons/icon-maskable-512.png', 'icons/apple-touch-icon.png', 'icons/favicon-32.png'];
+/* Proforma service worker
+   Network-first: the app always loads the newest files when online,
+   and falls back to the saved copy when offline.
+   Change CACHE (e.g. proforma-v4) whenever you want to force a clean start. */
+const CACHE = 'proforma-v4';
+const SHELL = ['index.html', 'manifest.webmanifest'];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
-});
-self.addEventListener('activate', e => {
+  self.skipWaiting();
   e.waitUntil(
-    caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k.startsWith('proforma-shell-') && k !== CACHE).map(k => caches.delete(k))))
-      .then(() => self.clients.claim())
+    caches.open(CACHE).then(c =>
+      Promise.allSettled(SHELL.map(u => c.add(new Request(u, { cache: 'reload' }))))
+    )
   );
 });
+
+self.addEventListener('activate', e => {
+  e.waitUntil((async () => {
+    for (const k of await caches.keys()) if (k !== CACHE) await caches.delete(k);
+    await self.clients.claim();
+  })());
+});
+
+// Safari/Chrome reject redirected responses for page loads, so copy them cleanly.
+const clean = async res =>
+  res.redirected
+    ? new Response(await res.blob(), { status: res.status, statusText: res.statusText, headers: res.headers })
+    : res;
+
 self.addEventListener('fetch', e => {
   const req = e.request;
-  if (req.method !== 'GET') return;
-  const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;           // never touch the Supabase API or other sites
-  if (req.mode === 'navigate') {                             // pages: newest from the network, cached copy when offline
-    e.respondWith(
-      fetch(req).then(res => {
-        if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put('index.html', copy)); }
-        return res;
-      }).catch(() => caches.match('index.html').then(m => m || caches.match('./')))
-    );
-    return;
-  }
-  e.respondWith(                                             // icons, manifest: cache first
-    caches.match(req).then(m => m || fetch(req).then(res => {
-      if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
+  if (req.method !== 'GET') return;                       // never touch saves/logins
+  if (new URL(req.url).origin !== location.origin) return; // server/API calls go straight through
+
+  e.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    try {
+      const res = await clean(await fetch(req, { cache: 'no-cache' }));
+      if (res.ok) cache.put(req, res.clone());
       return res;
-    }))
-  );
+    } catch (err) {
+      const hit = await cache.match(req, { ignoreSearch: true });
+      if (hit) return hit;
+      if (req.mode === 'navigate') {
+        const shell = await cache.match('index.html');
+        if (shell) return shell;
+      }
+      return Response.error();
+    }
+  })());
 });
